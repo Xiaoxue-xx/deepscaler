@@ -19,9 +19,9 @@ from verl import DataProto
 import torch
 from verl.utils.reward_score import gsm8k, math
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from deepscaler.rewards import RewardConfig, RewardFn, RewardInput, RewardOutput, RewardType
 
-
-from deepscaler.rewards.math_reward import deepscaler_reward_fn
+from deepscaler.rewards.math_reward import deepscaler_reward_fn, CustomRewardMathFn
 
 def _select_rm_score_fn(data_source):
     if data_source == 'openai/gsm8k':
@@ -31,7 +31,6 @@ def _select_rm_score_fn(data_source):
     else:
         return deepscaler_reward_fn
 
-
 class RewardManager():
     """The reward manager.
     """
@@ -39,6 +38,7 @@ class RewardManager():
     def __init__(self, tokenizer, num_examine) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        self.reward_fn = CustomRewardMathFn(RewardConfig())
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -53,11 +53,8 @@ class RewardManager():
 
         from concurrent.futures import ThreadPoolExecutor
         from typing import Dict, Any
-        #import threading
-        # Thread-safe dict for tracking printed data sources
-        # print_lock = threading.Lock()
-        
-        def process_item(args):
+
+        def compute_correctness_and_length(args):
             i, data_item, already_print_data_sources = args
             prompt_ids = data_item.batch['prompts']
             prompt_length = prompt_ids.shape[-1]
@@ -80,23 +77,71 @@ class RewardManager():
             compute_score_fn = _select_rm_score_fn(data_source)
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
             
-            # with print_lock:
-            #     if data_source not in already_print_data_sources:
-            #         already_print_data_sources[data_source] = 0
-
-            #     if already_print_data_sources[data_source] < self.num_examine:
-            #         already_print_data_sources[data_source] += 1
-            #         print(sequences_str)      
-            return i, score, valid_response_length
+            return i, score.is_correct, valid_response_length
 
         # Process items in parallel using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=96) as executor:
             args = [(i, data[i], already_print_data_sources) for i in range(len(data))]
-            results = list(executor.map(process_item, args))
+            results = list(executor.map(compute_correctness_and_length, args))
 
-        # Fill reward tensor with results
-        for i, score, valid_response_length in results:
-            reward_tensor[i, valid_response_length - 1] = score
+        # 收集所有 responses 的正确性和长度
+        correct_responses = 0
+        total_responses = len(results)
+        response_lengths = []
+        correctness = []
+        for i, is_correct, valid_response_length in results:
+            if is_correct:
+                correct_responses += 1
+            response_lengths.append(valid_response_length)
+            correctness.append(is_correct)
+
+        # 计算 p, L_r 和 L_max
+        p = correct_responses / total_responses if total_responses > 0 else 0
+        L_r = sum(response_lengths) / total_responses if total_responses > 0 else 0
+        L_max = max(response_lengths) if response_lengths else 0
+
+        # 计算 L_budget
+        L_budget = p * L_r + (1 - p) * L_max
+
+        def compute_reward(args):
+            i, data_item, is_correct, length = args
+            prompt_ids = data_item.batch['prompts']
+            prompt_length = prompt_ids.shape[-1]
+            
+            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch['responses'] 
+            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
+            sequences_str = self.tokenizer.decode(sequences)
+
+            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+
+            # 创建 RewardInput 对象
+            reward_input = RewardInput(
+                problem=data_item.non_tensor_batch['problem'],
+                model_response=sequences_str,
+                problem_type=RewardType.MATH,
+                ground_truth=ground_truth
+            )
+
+            # 计算奖励
+            reward_output = self.reward_fn.compute_reward(reward_input, L_budget, is_correct, length)
+
+            return i, reward_output.reward
+
+        # Process items in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=96) as executor:
+            args = [(i, data[i], correctness[i], response_lengths[i]) for i in range(len(data))]
+            rewards = list(executor.map(compute_reward, args))
+
+        # 填充 reward_tensor
+        for i, reward, valid_response_length in rewards:
+            reward_tensor[i, valid_response_length - 1] = reward
 
         return reward_tensor
 
