@@ -132,7 +132,7 @@ class RewardManager():
             # 计算奖励
             reward_output = self.reward_fn.compute_reward(reward_input, L_budget, is_correct, length)
 
-            return i, reward_output.reward
+            return i, reward_output.reward, valid_response_length
 
         # Process items in parallel using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=96) as executor:
