@@ -40,7 +40,7 @@ def make_map_fn(split: str):
     """
     def process_fn(example: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
         question = example.pop('problem')
-        instruction = "Let's think step by step and output the final answer within \\boxed{}."
+        instruction = "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>. In the reasoning process, you think fast in simple steps and slowly in complex steps, and put the slow thinking content in <slow_think></slow_think> and fast thinking content in <fast_think></fast_think>. Let's think step by step and output the final answer within \\boxed{}."
         question = f"{question} {instruction}"
         answer = example.pop('answer')
 
