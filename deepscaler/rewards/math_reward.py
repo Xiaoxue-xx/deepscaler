@@ -4,7 +4,8 @@ and assigns rewards based on their correctness. It utilizes a language model to
 validate answers when necessary.
 """
 from typing import List, Union
-
+import pdb
+import numpy as np
 from deepscaler.globals import THOUGHT_DELIMITER_START, THOUGHT_DELIMITER_END, OAI_RM_MODEL
 from deepscaler.rewards import RewardConfig, RewardFn, RewardInput, RewardOutput, RewardType
 from deepscaler.rewards.math_utils.utils import extract_answer, grade_answer_sympy, grade_answer_mathd
@@ -36,7 +37,8 @@ class RewardMathFn(RewardFn):
         if THOUGHT_DELIMITER_START in model_response and THOUGHT_DELIMITER_END in model_response:
             model_solution = model_response.split(THOUGHT_DELIMITER_END)[1]
         else:
-            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+            model_solution = model_response
+            # return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
         model_answer = extract_answer(model_solution)
         if model_answer is None:
@@ -95,57 +97,54 @@ class RewardMathFn(RewardFn):
                     if "[[YES]]" in orm_response:
                         return RewardOutput(reward=self.config.correct_reward, is_correct=True)
                     continue
-                
+        # pdb.set_trace()       
         return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
-
+        
 class CustomRewardMathFn(RewardMathFn):
     """
-    Custom reward function for evaluating mathematical answers with additional logic.
+    Reward function:
+    - Correct: shorter = higher reward (> 0.1), longer = lower but > 0
+    - Incorrect: shorter = heavier penalty (→ -1), longer = lighter penalty (→ -0.1)
     """
 
-    def compute_correctness_and_length(self, input: RewardInput) -> List[RewardOutput]:
-        """
-        计算所有 response 的正确性和长度。
-        """
-        results = []
-        for response in input.responses:
-            reward_output = super().__call__(response)
-            results.append(reward_output)
-        return results
+    def compute_reward(self, input: RewardInput, L_budget: float, is_correct: bool, length: int, p: float) -> RewardOutput:
+        w_acc = 1.0
+        w_len = 0.2
+        w_think = 0.1
 
-    def compute_reward(self, input: RewardInput, L_budget: float, is_correct: bool, length: int) -> RewardOutput:
-        """
-        计算每个 response 的奖励。
-        """
-        # 计算 lambda
-        L_i = length
-        lambda_value = (L_i - L_budget) / L_budget if L_budget != 0 else 0
-        
-        # 根据 lambda 和正确性修改奖励
+        lambda_val = (length - L_budget) / L_budget if L_budget > 0 else 0.0
+
+
         if is_correct:
-            reward = max(-0.5 * lambda_value + 0.5, 0.1)
+            length_score = np.tanh(-lambda_val)   
+            # length_score = -0.5 * lambda_val  
         else:
-            reward = max(0.9 * lambda_value - 0.1, -0.1)
-        
-        # 解析 <fast_think> 和 <slow_think> 内容
-        fast_think_content = self.extract_think_content(input.model_response, "fast_think")
-        slow_think_content = self.extract_think_content(input.model_response, "slow_think")
-        
-        # 计算快思考和慢思考的比例
-        total_think_content = len(fast_think_content) + len(slow_think_content)
-        fast_think_ratio = len(fast_think_content) / total_think_content if total_think_content > 0 else 0
-        slow_think_ratio = len(slow_think_content) / total_think_content if total_think_content > 0 else 0
-        
-        # 根据 p 调整对 <fast_think> 和 <slow_think> 的奖励
-        if p > 0.5:
-            # p 大则鼓励快思考比例增加
-            reward += 0.1 * fast_think_ratio
+            # length_score = 0.5 * lambda_val 
+            length_score = -np.tanh(-lambda_val)  
+
+        fast = self.extract_think_content(input.model_response, "fast_think")
+        slow = self.extract_think_content(input.model_response, "slow_think")
+        total = len(fast) + len(slow)
+        fast_ratio = len(fast) / total if total > 0 else 0.0
+        slow_ratio = len(slow) / total if total > 0 else 0.0
+        think_score = fast_ratio if p > 0.5 else slow_ratio
+
+        if p != 0:
+            reward = w_acc * (1.0 if is_correct else -1.0) + w_len * length_score + w_think * think_score
         else:
-            # p 小则鼓励慢思考比例增加
-            reward += 0.1 * slow_think_ratio
+            reward = 1.0 if is_correct else -1.0
         
+
+        if is_correct:
+            reward = max(reward, 0.1)
+
+        else:
+            reward = min(reward, -0.1)
+
+        # reward = float(np.clip(reward, -1.0, 1.0))
         return RewardOutput(reward=reward, is_correct=is_correct)
-    
+
+
     def extract_think_content(self, response: str, think_type: str) -> str:
         """
         提取指定类型的思考内容（<fast_think> 或 <slow_think>）。
@@ -156,11 +155,12 @@ class CustomRewardMathFn(RewardMathFn):
             return response.split(start_tag)[1].split(end_tag)[0]
         return ""
 
+
 def deepscaler_reward_fn(solution_str: str, ground_truth: Union[str, List[str]], enable_llm = False):
     reward_config = RewardConfig()
     reward_config.use_math_orm = enable_llm
-    reward_fn = CustomRewardMathFn(reward_config)
-    reward_response = reward_fn.compute_correctness_and_length(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, ground_truth={"answer": ground_truth}))
+    reward_fn = RewardMathFn(reward_config)
+    reward_response = reward_fn(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, ground_truth={"answer": ground_truth}))
     return reward_response.is_correct
 
 if __name__ == "__main__":
