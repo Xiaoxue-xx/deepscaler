@@ -17,10 +17,12 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 from verl import DataProto
 import torch
+import sys
 from verl.utils.reward_score import gsm8k, math
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from deepscaler.rewards import RewardConfig, RewardFn, RewardInput, RewardOutput, RewardType
-
+from deepscaler.rewards import RewardConfig, RewardInput, RewardType
+import numpy as np
+import pdb
 from deepscaler.rewards.math_reward import deepscaler_reward_fn, CustomRewardMathFn
 
 def _select_rm_score_fn(data_source):
@@ -41,109 +43,97 @@ class RewardManager():
         self.reward_fn = CustomRewardMathFn(RewardConfig())
 
     def __call__(self, data: DataProto):
-        """We will expand this function gradually based on the available datasets"""
-
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if 'rm_scores' in data.batch.keys():
             return data.batch['rm_scores']
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
-        already_print_data_sources = {}
+        uids = data.non_tensor_batch['uid']
+        unique_uids = np.unique(uids)
 
         from concurrent.futures import ThreadPoolExecutor
-        from typing import Dict, Any
 
-        def compute_correctness_and_length(args):
-            i, data_item, already_print_data_sources = args
-            prompt_ids = data_item.batch['prompts']
-            prompt_length = prompt_ids.shape[-1]
-            
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+        def process_prompt_group(uid):
+            uid_mask = uids == uid
+            indices = [i for i, m in enumerate(uid_mask) if m]
+            # pdb.set_trace()
+            group_data = data[indices]
 
-            response_ids = data_item.batch['responses'] 
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
+            def compute_correctness_and_length(i, data_item):
+                prompt_ids = data_item.batch['prompts']
+                prompt_length = prompt_ids.shape[-1]
+                valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+                valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
+                response_ids = data_item.batch['responses']
+                valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+                valid_response_ids = response_ids[:valid_response_length]
 
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+                sequence = torch.cat((valid_prompt_ids, valid_response_ids))
+                sequence_str = self.tokenizer.decode(sequence)
+                ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
-            # select rm_score
-            data_source = data_item.non_tensor_batch['data_source']
-            compute_score_fn = _select_rm_score_fn(data_source)
-            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
-            
-            return i, score.is_correct, valid_response_length
+                compute_score_fn = _select_rm_score_fn(data_item.non_tensor_batch['data_source'])
+                is_correct = compute_score_fn(solution_str=sequence_str, ground_truth=ground_truth)
+                return i, is_correct, valid_response_length
 
-        # Process items in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=96) as executor:
-            args = [(i, data[i], already_print_data_sources) for i in range(len(data))]
-            results = list(executor.map(compute_correctness_and_length, args))
+            correctness = []
+            lengths = []
+            correct_lengths = []
+            for local_i, idx in enumerate(indices):
+                _, is_correct, l = compute_correctness_and_length(local_i, data[idx])
+                correctness.append(is_correct)
+                lengths.append(l)
+                if is_correct:
+                    correct_lengths.append(l)
+            p = sum(correctness) / len(correctness) if correctness else 0
+            L_r = sum(correct_lengths) / len(correct_lengths) if correct_lengths else 0
+            L_max = max(lengths) if lengths else 0
+            L_budget = p * L_r + (1 - p) * L_max
+            print("uid:" + str(uid)+ "p:"+str(p)+ 'L_budget:'+ str(L_budget))
 
-        # 收集所有 responses 的正确性和长度
-        correct_responses = 0
-        total_responses = len(results)
-        response_lengths = []
-        correctness = []
-        for i, is_correct, valid_response_length in results:
-            if is_correct:
-                correct_responses += 1
-            response_lengths.append(valid_response_length)
-            correctness.append(is_correct)
+            def compute_reward(local_i, data_item, is_correct, length):
+                prompt_ids = data_item.batch['prompts']
+                prompt_length = prompt_ids.shape[-1]
+                valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+                valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
-        # 计算 p, L_r 和 L_max
-        p = correct_responses / total_responses if total_responses > 0 else 0
-        L_r = sum(response_lengths) / total_responses if total_responses > 0 else 0
-        L_max = max(response_lengths) if response_lengths else 0
+                response_ids = data_item.batch['responses']
+                valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+                valid_response_ids = response_ids[:valid_response_length]
 
-        # 计算 L_budget
-        L_budget = p * L_r + (1 - p) * L_max
+                sequence = torch.cat((valid_prompt_ids, valid_response_ids))
+                sequence_str = self.tokenizer.decode(sequence)
+                ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
-        def compute_reward(args):
-            i, data_item, is_correct, length = args
-            prompt_ids = data_item.batch['prompts']
-            prompt_length = prompt_ids.shape[-1]
-            
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+                reward_input = RewardInput(
+                    problem=sequence_str,
+                    model_response=sequence_str,
+                    problem_type=RewardType.MATH,
+                    ground_truth=ground_truth
+                )
+                reward_output = self.reward_fn.compute_reward(reward_input, L_budget, is_correct, length, p)
+                return reward_output.reward, valid_response_length, sequence_str, ground_truth
 
-            response_ids = data_item.batch['responses'] 
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
+            for local_i, idx in enumerate(indices):
+                reward, valid_response_length, sequence_str, ground_truth = compute_reward(
+                    local_i, data[idx], correctness[local_i], lengths[local_i]
+                )
+                reward_tensor[idx, valid_response_length - 1] = reward
+                if self.num_examine > 0 and local_i < self.num_examine:
+                    print(f"\n[Prompt UID: {uid}] Sample {local_i + 1}/{len(indices)}")
+                    print("=" * 50)
+                    print(f"[Decoded Sequence]:\n{sequence_str}")
+                    print(f"[Ground Truth]: {ground_truth}")
+                    print(f"[Correct]: {correctness[local_i]} | [Length]: {lengths[local_i]} | [Reward]: {reward:.4f}")
+                    print("=" * 50)
 
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
-
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
-            # 创建 RewardInput 对象
-            reward_input = RewardInput(
-                problem=data_item.non_tensor_batch['problem'],
-                model_response=sequences_str,
-                problem_type=RewardType.MATH,
-                ground_truth=ground_truth
-            )
-
-            # 计算奖励
-            reward_output = self.reward_fn.compute_reward(reward_input, L_budget, is_correct, length)
-
-            return i, reward_output.reward, valid_response_length
-
-        # Process items in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=96) as executor:
-            args = [(i, data[i], correctness[i], response_lengths[i]) for i in range(len(data))]
-            rewards = list(executor.map(compute_reward, args))
-
-        # 填充 reward_tensor
-        for i, reward, valid_response_length in rewards:
-            reward_tensor[i, valid_response_length - 1] = reward
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            executor.map(process_prompt_group, unique_uids)
 
         return reward_tensor
+
+
 
 
 import ray
@@ -226,14 +216,12 @@ def main_task(config):
             raise NotImplementedError
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
-
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=2)
 
     # Note that we always use function-based RM for validation
     val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,
                             role_worker_mapping=role_worker_mapping,
